@@ -1,0 +1,16 @@
+{
+  "name": "mnemosyne-vessel-server",
+  "version": "0.1.0",
+  "description": "Multiplayer referee server for MNEMOSYNE — The Sprawl (private coded rooms)",
+  "main": "vessel-server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node vessel-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.21.1"
+  }
+}
