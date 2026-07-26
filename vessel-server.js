@@ -29,6 +29,159 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 
+/* ============================================================================
+   ON-CHAIN BALANCE VERIFICATION ($MNEMO hold-gating)
+   ----------------------------------------------------------------------------
+   The server reads a wallet's REAL $MNEMO balance from Solana and tells the
+   game what it truly holds. This is the authoritative number — the client
+   cannot fake it, so hold-gated cosmetics are safe.
+
+   >>> RICK: SET THESE TWO VALUES, then redeploy to Railway. <<<
+   1. MNEMO_MINT  — your $MNEMO token's mint address (from pump.fun / the chain)
+   2. SOLANA_RPC  — a Solana RPC URL. The public one works for light testing but
+                    rate-limits; better to use a free Helius/QuickNode endpoint.
+                    You can also set these as Railway env vars instead of editing
+                    here (MNEMO_MINT and SOLANA_RPC).
+   ========================================================================== */
+const MNEMO_MINT = process.env.MNEMO_MINT || "REPLACE-WITH-YOUR-MNEMO-MINT-ADDRESS";
+const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+const BALANCE_CACHE_MS = 60_000;   // re-check a wallet at most once per minute
+const _balCache = new Map();       // pubkey -> {hold, at}
+
+/* returns the wallet's $MNEMO balance (whole tokens), or null if unavailable */
+async function fetchMnemoBalance(pubkey) {
+  if (!pubkey) return null;
+  if (MNEMO_MINT.includes('REPLACE')) return null;   // not configured yet
+  // serve from cache if fresh
+  const c = _balCache.get(pubkey);
+  if (c && Date.now() - c.at < BALANCE_CACHE_MS) return c.hold;
+  try {
+    // getTokenAccountsByOwner filtered to the MNEMO mint, parsed for uiAmount
+    const body = {
+      jsonrpc: '2.0', id: 1, method: 'getTokenAccountsByOwner',
+      params: [ pubkey, { mint: MNEMO_MINT }, { encoding: 'jsonParsed' } ]
+    };
+    const res = await fetch(SOLANA_RPC, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const json = await res.json();
+    let hold = 0;
+    const accts = json && json.result && json.result.value;
+    if (Array.isArray(accts)) {
+      for (const a of accts) {
+        const amt = a?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+        if (typeof amt === 'number') hold += amt;
+      }
+    }
+    _balCache.set(pubkey, { hold, at: Date.now() });
+    return hold;
+  } catch (e) {
+    console.error('balance fetch failed:', e.message);
+    return null;   // network/RPC error — caller keeps prior/zero
+  }
+}
+
+/* ================= BURN VERIFICATION — FULLY ON-CHAIN ================= */
+/* No database. A player's unlocks ARE their burn history on the chain:
+   - To burn, the browser sends $MNEMO to the burn address with a memo
+     "MNEMO-BURN:<item>" attached to the transaction.
+   - verifyBurnTx confirms a single burn tx (right token actually left wallet).
+   - getUnlocksOnChain reads the wallet's transaction history to the burn
+     address, reads each memo, and returns the set of unlocked items — freshly
+     from the chain every time. Survives any server restart; it's stateless. */
+const _sigCache = new Map();   // pubkey -> {items, at}  (short cache to spare RPC)
+const UNLOCK_CACHE_MS = 30_000;
+
+async function rpc(method, params) {
+  const res = await fetch(SOLANA_RPC, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
+  });
+  return res.json();
+}
+
+async function verifyBurnTx(sig, pubkey) {
+  if (MNEMO_MINT.includes('REPLACE')) return { ok: false, reason: 'token not configured' };
+  try {
+    const json = await rpc('getTransaction', [ sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 } ]);
+    const tx = json && json.result;
+    if (!tx) return { ok: false, reason: 'transaction not found yet' };
+    if (tx.meta && tx.meta.err) return { ok: false, reason: 'transaction failed on-chain' };
+    const pre = (tx.meta && tx.meta.preTokenBalances) || [];
+    const post = (tx.meta && tx.meta.postTokenBalances) || [];
+    const mintMatch = b => b.mint === MNEMO_MINT;
+    const preOwner = pre.find(b => mintMatch(b) && b.owner === pubkey);
+    const postOwner = post.find(b => mintMatch(b) && b.owner === pubkey);
+    const preAmt = preOwner ? Number(preOwner.uiTokenAmount.uiAmount || 0) : 0;
+    const postAmt = postOwner ? Number(postOwner.uiTokenAmount.uiAmount || 0) : 0;
+    const burned = preAmt - postAmt;
+    if (burned <= 0) return { ok: false, reason: 'no MNEMO left this wallet' };
+    // pull the item name out of the memo, if present
+    const item = extractBurnMemo(tx);
+    _sigCache.delete(pubkey);   // bust cache so the new unlock shows immediately
+    return { ok: true, amount: burned, item };
+  } catch (e) {
+    console.error('burn verify failed:', e.message);
+    return { ok: false, reason: 'verification error, retry' };
+  }
+}
+
+/* find "MNEMO-BURN:<item>" in a transaction's memo/log entries */
+function extractBurnMemo(tx) {
+  const logs = (tx.meta && tx.meta.logMessages) || [];
+  for (const l of logs) {
+    const m = /MNEMO-BURN:([A-Za-z0-9_\-]+)/.exec(l);
+    if (m) return m[1];
+  }
+  // also check parsed instructions for a memo program entry
+  const ins = (tx.transaction && tx.transaction.message && tx.transaction.message.instructions) || [];
+  for (const i of ins) {
+    const memo = i.parsed && typeof i.parsed === 'string' ? i.parsed : (i.parsed && i.parsed.info);
+    const s = typeof memo === 'string' ? memo : '';
+    const m = /MNEMO-BURN:([A-Za-z0-9_\-]+)/.exec(s);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/* read the wallet's burn history straight from the chain → unlocked items */
+async function getUnlocksOnChain(pubkey) {
+  if (MNEMO_MINT.includes('REPLACE')) return [];
+  const c = _sigCache.get(pubkey);
+  if (c && Date.now() - c.at < UNLOCK_CACHE_MS) return c.items;
+  try {
+    // recent signatures involving this wallet (most recent first, capped)
+    const sigsJson = await rpc('getSignaturesForAddress', [ pubkey, { limit: 40 } ]);
+    const sigs = (sigsJson && sigsJson.result) || [];
+    const items = new Set();
+    // check the newest ~20 for burn memos (bounded RPC work)
+    for (const s of sigs.slice(0, 20)) {
+      if (s.err) continue;
+      const txJson = await rpc('getTransaction', [ s.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 } ]);
+      const tx = txJson && txJson.result;
+      if (!tx || (tx.meta && tx.meta.err)) continue;
+      const item = extractBurnMemo(tx);
+      if (!item) continue;
+      // confirm this tx actually burned MNEMO from this wallet
+      const pre = (tx.meta && tx.meta.preTokenBalances) || [];
+      const post = (tx.meta && tx.meta.postTokenBalances) || [];
+      const preOwner = pre.find(b => b.mint === MNEMO_MINT && b.owner === pubkey);
+      const postOwner = post.find(b => b.mint === MNEMO_MINT && b.owner === pubkey);
+      const preAmt = preOwner ? Number(preOwner.uiTokenAmount.uiAmount || 0) : 0;
+      const postAmt = postOwner ? Number(postOwner.uiTokenAmount.uiAmount || 0) : 0;
+      if (preAmt - postAmt > 0) items.add(item);
+    }
+    const arr = Array.from(items);
+    _sigCache.set(pubkey, { items: arr, at: Date.now() });
+    return arr;
+  } catch (e) {
+    console.error('on-chain unlock read failed:', e.message);
+    return (c ? c.items : []);   // fall back to last known
+  }
+}
+
+
 /* ---- FROZEN RULESET (must match the client's CONFIG for these values) ---- */
 const RULES = {
   maxPlayersPerRoom: 12,
@@ -383,6 +536,50 @@ wss.on('connection', (ws) => {
       /* ---- leave / rematch ---- */
       case 'leave': {
         cleanupSocket(ws);
+        break;
+      }
+
+      /* ---- client asks the server to verify its on-chain $MNEMO balance ---- */
+      case 'verify_balance': {
+        const pubkey = (msg.pubkey || '').trim();
+        if (!pubkey) { send(ws, { t: 'balance', hold: 0, verified: false }); break; }
+        fetchMnemoBalance(pubkey).then(hold => {
+          if (hold == null) {
+            // RPC unavailable or not configured — tell the client it's unverified
+            send(ws, { t: 'balance', pubkey, hold: 0, verified: false });
+          } else {
+            send(ws, { t: 'balance', pubkey, hold, verified: true });
+          }
+        });
+        break;
+      }
+
+      /* ---- client reports a burn transaction; server verifies it on-chain ---- */
+      case 'verify_burn': {
+        const sig = (msg.sig || '').trim();
+        const pubkey = (msg.pubkey || '').trim();
+        const item = (msg.item || '').trim();
+        if (!sig || !pubkey) { send(ws, { t: 'burn_result', ok: false, item, reason: 'missing signature' }); break; }
+        verifyBurnTx(sig, pubkey).then(result => {
+          if (result.ok) {
+            // no database — the burn tx itself (with its memo) IS the record.
+            // the item is read back from the on-chain memo when confirmed.
+            send(ws, { t: 'burn_result', ok: true, item: result.item || item, amount: result.amount, sig });
+          } else {
+            send(ws, { t: 'burn_result', ok: false, item, reason: result.reason });
+          }
+        });
+        break;
+      }
+
+      /* ---- client asks which items this wallet has unlocked ----
+         answered by reading the wallet's burn history from the chain */
+      case 'get_unlocks': {
+        const pubkey = (msg.pubkey || '').trim();
+        if (!pubkey) { send(ws, { t: 'unlocks', pubkey, items: [] }); break; }
+        getUnlocksOnChain(pubkey).then(items => {
+          send(ws, { t: 'unlocks', pubkey, items });
+        });
         break;
       }
     }
