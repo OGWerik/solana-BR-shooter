@@ -219,6 +219,10 @@ const XP_VALUES = { kill:100, perPlace:20, win:500, onlineMatch:50 };
 function blankProfile(pubkey){
   return { pubkey, xp:0, level:1, prestige:0,
            season:SEASON, seasonXp:0, matches:0, kills:0, wins:0,
+           /* equipped loadout + paint, so your machine looks the same on any
+              device. What you OWN already follows the wallet (on-chain burns
+              and balance); this is what you're WEARING. */
+           loadout:null, paint:null,
            firstSeen:Date.now(), lastSeen:Date.now() };
 }
 function getProfile(pubkey){
@@ -697,7 +701,39 @@ wss.on('connection', (ws) => {
         send(ws, { t:'profile', verified:true, season:SEASON,
                    level:prof.level, prestige:prof.prestige, xp:prof.xp,
                    seasonXp:prof.seasonXp, matches:prof.matches,
-                   kills:prof.kills, wins:prof.wins });
+                   kills:prof.kills, wins:prof.wins,
+                   loadout:prof.loadout, paint:prof.paint });
+        break;
+      }
+
+      /* ---- your machine's look, saved against the wallet ---- */
+      case 'save_loadout': {
+        const pubkey = (msg.pubkey || '').trim() || ws._pubkey;
+        if (!pubkey) break;
+        const prof = getProfile(pubkey);
+        /* store only known cosmetic slots, and only short string ids, so a
+           client can't stuff arbitrary data into the profile file */
+        const SLOTS = ['body','head','shoulder','legs','chassis','core','melee',
+                       'camo','tracer','grenade','trail','boost','death','voice'];
+        if (msg.loadout && typeof msg.loadout === 'object') {
+          const clean = {};
+          for (const k of SLOTS) {
+            const v = msg.loadout[k];
+            if (typeof v === 'string' && v.length && v.length <= 24) clean[k] = v;
+          }
+          prof.loadout = clean;
+        }
+        if (msg.paint && typeof msg.paint === 'object') {
+          const p = {};
+          for (const k of ['body','trim','glow','finish']) {
+            const v = msg.paint[k];
+            if (typeof v === 'string' && v.length <= 24) p[k] = v;
+          }
+          prof.paint = p;
+        }
+        prof.lastSeen = Date.now();
+        _dirty = true;
+        send(ws, { t:'loadout_saved', ok:true });
         break;
       }
 
@@ -709,7 +745,8 @@ wss.on('connection', (ws) => {
         send(ws, { t:'profile', verified:true, season:SEASON,
                    level:prof.level, prestige:prof.prestige, xp:prof.xp,
                    seasonXp:prof.seasonXp, matches:prof.matches,
-                   kills:prof.kills, wins:prof.wins });
+                   kills:prof.kills, wins:prof.wins,
+                   loadout:prof.loadout, paint:prof.paint });
         break;
       }
 
