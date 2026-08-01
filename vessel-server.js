@@ -182,6 +182,89 @@ async function getUnlocksOnChain(pubkey) {
 }
 
 
+/* ================= PLAYER PROFILES — SERVER-AUTHORITATIVE XP =================
+   Progression that decides anything of value (season standing, airdrop weight)
+   cannot live in the browser: localStorage is editable, so a client-reported
+   level is worth nothing. The server awards XP from ITS OWN record of a match
+   — kills it validated, placement it observed — and stores it against the
+   wallet, so it follows the player to any device.
+
+   ONLINE ONLY, deliberately. Single-player matches happen entirely client-side
+   and the server sees nothing, so they cannot be verified and do not accrue
+   season XP. Offline play still levels the local display; it just doesn't count
+   toward anything redeemable.
+
+   Storage: a JSON file on disk. Point DATA_DIR at a Railway Volume to make it
+   survive redeploys — without a volume the container filesystem is ephemeral
+   and this resets on every deploy (the server logs a warning if so).        */
+const fsp = require('fs');
+const pathp = require('path');
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const PROFILE_FILE = pathp.join(DATA_DIR, 'profiles.json');
+const SEASON = process.env.SEASON_ID || 'S1';
+
+const PROFILES = new Map();      // pubkey -> profile
+let _dirty = false, _persistOK = false;
+
+const XP_CAP = 50;
+function xpToNext(level){ return Math.round(120 + 22 * Math.pow(Math.max(1, level), 1.30)); }
+const XP_VALUES = { kill:100, perPlace:20, win:500, onlineMatch:50 };
+
+function blankProfile(pubkey){
+  return { pubkey, xp:0, level:1, prestige:0,
+           season:SEASON, seasonXp:0, matches:0, kills:0, wins:0,
+           firstSeen:Date.now(), lastSeen:Date.now() };
+}
+function getProfile(pubkey){
+  if (!pubkey) return null;
+  let p = PROFILES.get(pubkey);
+  if (!p) { p = blankProfile(pubkey); PROFILES.set(pubkey, p); }
+  if (p.season !== SEASON) { p.season = SEASON; p.seasonXp = 0; }  // new season resets the ladder
+  return p;
+}
+function awardXP(pubkey, amount){
+  const p = getProfile(pubkey);
+  if (!p) return null;
+  amount = Math.max(0, Math.round(amount || 0));
+  p.xp += amount; p.seasonXp += amount; p.lastSeen = Date.now();
+  let guard = 0;
+  while (guard++ < 500) {
+    if (p.level >= XP_CAP) { p.prestige += 1; p.level = 1; p.xp = 0; break; }
+    const need = xpToNext(p.level);
+    if (p.xp < need) break;
+    p.xp -= need; p.level += 1;
+  }
+  _dirty = true;
+  return p;
+}
+function loadProfiles(){
+  try {
+    if (!fsp.existsSync(DATA_DIR)) fsp.mkdirSync(DATA_DIR, { recursive: true });
+    if (fsp.existsSync(PROFILE_FILE)) {
+      const raw = JSON.parse(fsp.readFileSync(PROFILE_FILE, 'utf8'));
+      for (const p of raw.profiles || []) PROFILES.set(p.pubkey, p);
+      console.log('[profiles] loaded', PROFILES.size, 'from', PROFILE_FILE);
+    }
+    fsp.writeFileSync(PROFILE_FILE + '.probe', 'ok'); fsp.unlinkSync(PROFILE_FILE + '.probe');
+    _persistOK = true;
+  } catch (e) {
+    console.warn('[profiles] NOT PERSISTENT —', e.message);
+    console.warn('[profiles] Add a Railway Volume and set DATA_DIR to it, or XP resets on every deploy.');
+  }
+}
+function saveProfiles(){
+  if (!_dirty || !_persistOK) return;
+  try {
+    fsp.writeFileSync(PROFILE_FILE,
+      JSON.stringify({ v:1, season:SEASON, profiles:[...PROFILES.values()] }));
+    _dirty = false;
+  } catch (e) { console.warn('[profiles] save failed:', e.message); }
+}
+loadProfiles();
+setInterval(saveProfiles, 10000);                 // debounce writes
+process.on('SIGTERM', () => { saveProfiles(); process.exit(0); });
+process.on('SIGINT',  () => { saveProfiles(); process.exit(0); });
+
 /* ---- FROZEN RULESET (must match the client's CONFIG for these values) ---- */
 const RULES = {
   maxPlayersPerRoom: 12,
@@ -250,7 +333,8 @@ function newRoom(code) {
     stormCz: RULES.fieldSize / 2,
     nextShrink: RULES.stormStartDelay,
     startAt: null,          // timestamp when countdown → match begins
-    countdownActive: false
+    countdownActive: false,
+    hostId: null            // only the host can start the match
   };
 }
 
@@ -268,6 +352,7 @@ function makePlayer(ws, name, faction, cosmetics) {
     alive: true,
     kills: 0,
     lastFire: {},           // weapon -> last-fire timestamp (server clock)
+    pubkey: null,           // set via 'link_wallet'; XP is credited to this
     joinedAt: Date.now()
   };
 }
@@ -289,6 +374,8 @@ function roomStateMsg(room) {
     code: room.code,
     started: room.started,
     over: room.over,
+    hostId: room.hostId,
+    minToStart: RULES.minPlayersToStart,
     countdown: room.countdownActive && room.startAt
       ? Math.max(0, Math.ceil((room.startAt - Date.now()) / 1000)) : null,
     players: [...room.players.values()].map(p => ({
@@ -299,19 +386,31 @@ function roomStateMsg(room) {
 }
 
 /* ------------------------------ MATCH FLOW ------------------------------- */
+/* The match no longer starts on its own the moment two people are present —
+   a private room needs time to fill up. The HOST presses start; everyone else
+   waits. This only cancels a countdown if the room drops below the minimum. */
 function maybeStartCountdown(room) {
   if (room.started || room.over) return;
-  const n = room.players.size;
-  if (n >= RULES.minPlayersToStart && !room.countdownActive) {
-    room.countdownActive = true;
-    room.startAt = Date.now() + RULES.startCountdown * 1000;
-    broadcast(room, { t: 'countdown', seconds: RULES.startCountdown });
-  } else if (n < RULES.minPlayersToStart && room.countdownActive) {
-    // dropped below min — cancel
+  if (room.players.size < RULES.minPlayersToStart && room.countdownActive) {
     room.countdownActive = false;
     room.startAt = null;
     broadcast(room, { t: 'countdown_cancel' });
   }
+}
+function hostStartMatch(room, ws) {
+  if (!room || room.started || room.over) return;
+  if (room.hostId !== ws.playerId) {
+    send(ws, { t: 'error', msg: 'Only the host can start the match.' });
+    return;
+  }
+  if (room.players.size < RULES.minPlayersToStart) {
+    send(ws, { t: 'error', msg: 'Need at least ' + RULES.minPlayersToStart + ' machines to start.' });
+    return;
+  }
+  if (room.countdownActive) return;
+  room.countdownActive = true;
+  room.startAt = Date.now() + RULES.startCountdown * 1000;
+  broadcast(room, { t: 'countdown', seconds: RULES.startCountdown });
 }
 
 function startMatch(room) {
@@ -344,11 +443,34 @@ function checkWin(room) {
   if (alive.length <= 1) {
     room.over = true;
     const winner = alive[0] || null;
+    /* Award XP from the server's own tally — kills it validated and placement
+       it observed. Nothing here comes from the client. */
+    const total = room.players.size;
+    const awards = {};
+    for (const p of room.players.values()) {
+      if (!p.pubkey) continue;                       // no wallet linked, no credit
+      const beaten = Math.max(0, total - 1 - (p.alive ? alive.length - 1 : 0));
+      let gained = XP_VALUES.onlineMatch
+                 + p.kills * XP_VALUES.kill
+                 + beaten * XP_VALUES.perPlace;
+      const won = winner && winner.id === p.id;
+      if (won) gained += XP_VALUES.win;
+      const prof = awardXP(p.pubkey, gained);
+      prof.matches++; prof.kills += p.kills; if (won) prof.wins++;
+      awards[p.id] = { gained, level: prof.level, prestige: prof.prestige,
+                       xp: prof.xp, seasonXp: prof.seasonXp };
+    }
     broadcast(room, {
       t: 'gameover',
       winnerId: winner ? winner.id : null,
       winnerName: winner ? winner.name : null
     });
+    /* each player gets their own verified progression back */
+    for (const p of room.players.values()) {
+      if (awards[p.id] && p.ws && p.ws.readyState === 1) {
+        send(p.ws, { t: 'xp', season: SEASON, verified: true, ...awards[p.id] });
+      }
+    }
   }
 }
 
@@ -470,8 +592,10 @@ wss.on('connection', (ws) => {
         const room = newRoom(code);
         rooms.set(code, room);
         const p = makePlayer(ws, msg.name, msg.faction, msg.cosmetics);
+        p.pubkey = ws._pubkey || null;      // carry a wallet linked before joining
         room.players.set(p.id, p);
         ws.roomCode = code; ws.playerId = p.id;
+        room.hostId = p.id;                 // creator hosts and controls the start
         send(ws, { t: 'joined', code, youId: p.id, host: true });
         broadcast(room, roomStateMsg(room));
         maybeStartCountdown(room);
@@ -488,6 +612,7 @@ wss.on('connection', (ws) => {
           send(ws, { t: 'error', msg: 'Room full' }); break;
         }
         const p = makePlayer(ws, msg.name, msg.faction, msg.cosmetics);
+        p.pubkey = ws._pubkey || null;      // carry a wallet linked before joining
         room.players.set(p.id, p);
         ws.roomCode = code; ws.playerId = p.id;
         send(ws, { t: 'joined', code, youId: p.id, host: false });
@@ -536,6 +661,54 @@ wss.on('connection', (ws) => {
       /* ---- leave / rematch ---- */
       case 'leave': {
         cleanupSocket(ws);
+        break;
+      }
+
+      /* ---- host starts the match when the lobby has filled up ---- */
+      case 'start_match': {
+        const rm = ws.roomCode ? rooms.get(ws.roomCode) : null;
+        if (rm) hostStartMatch(rm, ws);
+        break;
+      }
+
+      /* ---- link a wallet to this connection so XP can be credited ---- */
+      case 'link_wallet': {
+        const pubkey = (msg.pubkey || '').trim();
+        if (!pubkey) break;
+        ws._pubkey = pubkey;
+        /* if already in a room, stamp the wallet onto the live player record */
+        const rm = ws.roomCode ? rooms.get(ws.roomCode) : null;
+        const me = rm && ws.playerId ? rm.players.get(ws.playerId) : null;
+        if (me) me.pubkey = pubkey;
+        const prof = getProfile(pubkey);
+        send(ws, { t:'profile', verified:true, season:SEASON,
+                   level:prof.level, prestige:prof.prestige, xp:prof.xp,
+                   seasonXp:prof.seasonXp, matches:prof.matches,
+                   kills:prof.kills, wins:prof.wins });
+        break;
+      }
+
+      /* ---- fetch verified progression for a wallet ---- */
+      case 'get_profile': {
+        const pubkey = (msg.pubkey || '').trim() || ws._pubkey;
+        if (!pubkey) { send(ws, { t:'profile', verified:false }); break; }
+        const prof = getProfile(pubkey);
+        send(ws, { t:'profile', verified:true, season:SEASON,
+                   level:prof.level, prestige:prof.prestige, xp:prof.xp,
+                   seasonXp:prof.seasonXp, matches:prof.matches,
+                   kills:prof.kills, wins:prof.wins });
+        break;
+      }
+
+      /* ---- season leaderboard, ranked by verified season XP ---- */
+      case 'season_board': {
+        const top = [...PROFILES.values()]
+          .filter(p => p.season === SEASON && p.seasonXp > 0)
+          .sort((a,b) => b.seasonXp - a.seasonXp)
+          .slice(0, 50)
+          .map((p,i) => ({ rank:i+1, pubkey:p.pubkey.slice(0,4)+'…'+p.pubkey.slice(-4),
+                           seasonXp:p.seasonXp, level:p.level, prestige:p.prestige }));
+        send(ws, { t:'season_board', season:SEASON, top });
         break;
       }
 
@@ -596,6 +769,12 @@ function cleanupSocket(ws) {
   if (p) {
     room.players.delete(ws.playerId);
     broadcast(room, { t: 'left', id: ws.playerId });
+    /* if the HOST left, hand the room to whoever is still here — otherwise
+       nobody could ever press start and the lobby would be stuck forever */
+    if (room.hostId === ws.playerId) {
+      const next = room.players.values().next().value;
+      room.hostId = next ? next.id : null;
+    }
     if (room.started && !room.over) checkWin(room);
     broadcast(room, roomStateMsg(room));
     maybeStartCountdown(room);
