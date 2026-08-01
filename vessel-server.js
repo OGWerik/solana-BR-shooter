@@ -199,7 +199,13 @@ async function getUnlocksOnChain(pubkey) {
    and this resets on every deploy (the server logs a warning if so).        */
 const fsp = require('fs');
 const pathp = require('path');
-const DATA_DIR = process.env.DATA_DIR || '/data';
+/* Where progression is stored. Railway sets RAILWAY_VOLUME_MOUNT_PATH
+   automatically the moment you attach a Volume, so attaching one is the ONLY
+   step needed — no environment variable to configure by hand. DATA_DIR is kept
+   as a manual override for other hosts. */
+const DATA_DIR = process.env.DATA_DIR
+              || process.env.RAILWAY_VOLUME_MOUNT_PATH
+              || '/data';
 const PROFILE_FILE = pathp.join(DATA_DIR, 'profiles.json');
 const SEASON = process.env.SEASON_ID || 'S1';
 
@@ -243,13 +249,20 @@ function loadProfiles(){
     if (fsp.existsSync(PROFILE_FILE)) {
       const raw = JSON.parse(fsp.readFileSync(PROFILE_FILE, 'utf8'));
       for (const p of raw.profiles || []) PROFILES.set(p.pubkey, p);
-      console.log('[profiles] loaded', PROFILES.size, 'from', PROFILE_FILE);
+      console.log('[profiles] loaded', PROFILES.size, 'profiles from', PROFILE_FILE);
     }
     fsp.writeFileSync(PROFILE_FILE + '.probe', 'ok'); fsp.unlinkSync(PROFILE_FILE + '.probe');
     _persistOK = true;
+    console.log('[profiles] PERSISTENT ✓ storing XP at', DATA_DIR);
   } catch (e) {
-    console.warn('[profiles] NOT PERSISTENT —', e.message);
-    console.warn('[profiles] Add a Railway Volume and set DATA_DIR to it, or XP resets on every deploy.');
+    console.warn('[profiles] ============================================');
+    console.warn('[profiles] XP IS NOT PERSISTENT —', e.message);
+    console.warn('[profiles] Tried to write to:', DATA_DIR);
+    console.warn('[profiles] Attach a Railway Volume to this service and it');
+    console.warn('[profiles] will be picked up automatically on next deploy.');
+    console.warn('[profiles] Until then the game works fine, but levels reset');
+    console.warn('[profiles] whenever the server redeploys.');
+    console.warn('[profiles] ============================================');
   }
 }
 function saveProfiles(){
